@@ -116,7 +116,7 @@ var PrecompiledContractsCancun = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}):  &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}):  &blake2F{},
 	common.BytesToAddress([]byte{0xa}):  &kzgPointEvaluation{},
-	common.BytesToAddress([]byte{0xed}): &gpgEd25519Verify{},
+	common.BytesToAddress([]byte{0xed}): &gpgVerify{},
 }
 
 // PrecompiledContractsPrague contains the set of pre-compiled Ethereum
@@ -141,7 +141,7 @@ var PrecompiledContractsPrague = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x11}): &bls12381Pairing{},
 	common.BytesToAddress([]byte{0x12}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x13}): &bls12381MapG2{},
-	common.BytesToAddress([]byte{0xed}): &gpgEd25519Verify{},
+	common.BytesToAddress([]byte{0xed}): &gpgVerify{},
 }
 
 var PrecompiledContractsBLS = PrecompiledContractsPrague
@@ -177,7 +177,7 @@ var PrecompiledContractsGranite = map[common.Address]PrecompiledContract{
 	common.BytesToAddress([]byte{8}):          &bn256PairingGranite{},
 	common.BytesToAddress([]byte{9}):          &blake2F{},
 	common.BytesToAddress([]byte{0x0a}):       &kzgPointEvaluation{},
-	common.BytesToAddress([]byte{0xed}):       &gpgEd25519Verify{},
+	common.BytesToAddress([]byte{0xed}):       &gpgVerify{},
 	common.BytesToAddress([]byte{0x01, 0x00}): &p256Verify{},
 }
 
@@ -1359,26 +1359,26 @@ func (c *p256Verify) Run(input []byte) ([]byte, error) {
 	}
 }
 
-// gpgEd25519Verify implements native verification for ed25519 signatures produced via gpg
-type gpgEd25519Verify struct{}
+// gpgVerify implements native verification for ed25519 signatures produced via gpg
+type gpgVerify struct{}
 
 var (
-	errDecodingFailed   = errors.New("failed to decode input")
 	errInvalidPublicKey = errors.New("invalid public key")
+	errInvalidKeyId     = errors.New("public key and key id do not match")
 )
 
 // RequiredGas returns the gas required to execute the pre-compiled contract
-func (c *gpgEd25519Verify) RequiredGas(input []byte) uint64 {
+func (c *gpgVerify) RequiredGas(input []byte) uint64 {
 	// You can adjust this value based on your needs
-	return params.GpgEd25519VerifyGas
+	return params.GpgVerifyGas
 }
 
 // Run performs ed25519 signature verification
-func (c *gpgEd25519Verify) Run(input []byte) ([]byte, error) {
-	// Input should be: abi.encode(bytes32 message, bytes publicKey, bytes signature)
-	message, pubKey, signature, err := decodeGPGEd25519VerifyInput(input)
+func (c *gpgVerify) Run(input []byte) ([]byte, error) {
+	// Input should be: abi.encode(bytes32 message, bytes8 keyId, bytes publicKey, bytes signature)
+	message, keyId, pubKey, signature, err := decodegpgVerifyInput(input)
 	if err != nil {
-		return nil, errDecodingFailed
+		return nil, err
 	}
 
 	// Create message object
@@ -1388,6 +1388,10 @@ func (c *gpgEd25519Verify) Run(input []byte) ([]byte, error) {
 	pubKeyObj, err := pgpcrypto.NewKey(pubKey)
 	if err != nil {
 		return nil, errInvalidPublicKey
+	}
+
+	if pubKeyObj.GetKeyID() != binary.BigEndian.Uint64(keyId[:]) {
+		return nil, errInvalidKeyId
 	}
 
 	// Create public keyring
@@ -1410,20 +1414,25 @@ func (c *gpgEd25519Verify) Run(input []byte) ([]byte, error) {
 	return common.LeftPadBytes([]byte{1}, 32), nil
 }
 
-func decodeGPGEd25519VerifyInput(input []byte) ([32]byte, []byte, []byte, error) {
+func decodegpgVerifyInput(input []byte) ([32]byte, [8]byte, []byte, []byte, error) {
 	// Define ABI types
 	bytesType, err := abi.NewType("bytes", "", nil)
 	if err != nil {
-		return [32]byte{}, nil, nil, fmt.Errorf("failed to create bytes type: %v", err)
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("failed to create bytes type: %v", err)
 	}
 	bytes32Type, err := abi.NewType("bytes32", "", nil)
 	if err != nil {
-		return [32]byte{}, nil, nil, fmt.Errorf("failed to create bytes32 type: %v", err)
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("failed to create bytes32 type: %v", err)
+	}
+	bytes8Type, err := abi.NewType("bytes8", "", nil)
+	if err != nil {
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("failed to create bytes32 type: %v", err)
 	}
 
 	// Create ABI arguments
 	arguments := abi.Arguments{
 		{Type: bytes32Type},
+		{Type: bytes8Type},
 		{Type: bytesType},
 		{Type: bytesType},
 	}
@@ -1431,27 +1440,31 @@ func decodeGPGEd25519VerifyInput(input []byte) ([32]byte, []byte, []byte, error)
 	// Unpack the encoded data
 	unpacked, err := arguments.Unpack(input)
 	if err != nil {
-		return [32]byte{}, nil, nil, fmt.Errorf("failed to unpack data: %v", err)
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("failed to unpack data: %v", err)
 	}
 
 	// Ensure we have the correct number of elements
-	if len(unpacked) != 3 {
-		return [32]byte{}, nil, nil, fmt.Errorf("unexpected number of decoded arguments: got %d, want 3", len(unpacked))
+	if len(unpacked) != 4 {
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("unexpected number of decoded arguments: got %d, want 3", len(unpacked))
 	}
 
 	// Extract each value
 	message, ok := unpacked[0].([32]byte)
 	if !ok {
-		return [32]byte{}, nil, nil, fmt.Errorf("failed to cast message to [32]byte")
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("failed to cast message to [32]byte")
 	}
-	publicKey, ok := unpacked[1].([]byte)
+	keyId, ok := unpacked[1].([8]byte)
 	if !ok {
-		return [32]byte{}, nil, nil, fmt.Errorf("failed to cast publicKey to []byte")
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("failed to cast keyId to [8]byte")
 	}
-	signature, ok := unpacked[2].([]byte)
+	publicKey, ok := unpacked[2].([]byte)
 	if !ok {
-		return [32]byte{}, nil, nil, fmt.Errorf("failed to cast signature to []byte")
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("failed to cast publicKey to []byte")
+	}
+	signature, ok := unpacked[3].([]byte)
+	if !ok {
+		return [32]byte{}, [8]byte{}, nil, nil, fmt.Errorf("failed to cast signature to []byte")
 	}
 
-	return message, publicKey, signature, nil
+	return message, keyId, publicKey, signature, nil
 }
